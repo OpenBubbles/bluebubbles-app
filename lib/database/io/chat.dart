@@ -415,6 +415,9 @@ class Chat {
     _latestMessage = latestMessage;
   }
 
+  @Property()
+  bool isWhitelisted = false;
+
   factory Chat.fromMap(Map<String, dynamic> json) {
     final message = json['lastMessage'] != null ? Message.fromMap(json['lastMessage']!.cast<String, Object>()) : null;
     return Chat(
@@ -486,6 +489,7 @@ class Chat {
     bool updateAPNTitle = false,
     bool updateGuidRefs = false,
     bool updateTelephonyId = false,
+    bool updateWhitelisted = false,
   }) {
     if (kIsWeb) return this;
     Database.runInTransaction(TxMode.write, () {
@@ -560,6 +564,9 @@ class Chat {
       }
       if (!updateTelephonyId) {
         telephonyId = existing?.telephonyId ?? telephonyId;
+      }
+      if (updateWhitelisted) {
+        existing?.isWhitelisted = isWhitelisted;
       }
 
       /// Save the chat and add the participants
@@ -796,55 +803,58 @@ class Chat {
 
   /// Return whether or not the notification should be muted
   bool shouldMuteNotification(Message? message) {
-    /// Filter unknown senders & sender doesn't have a contact, then don't notify
-    if (ss.settings.filterUnknownSenders.value &&
-        participants.length == 1 &&
-        participants.first.contact == null) {
-      return true;
-
-      /// Check if global text detection is on and notify accordingly
-    } else if (ss.settings.globalTextDetection.value.isNotEmpty) {
-      List<String> text = ss.settings.globalTextDetection.value.split(",");
-      for (String s in text) {
-        if (message?.text?.toLowerCase().contains(s.toLowerCase()) ?? false) {
-          return false;
-        }
-      }
-      return true;
-
-      /// Check if muted
-    } else if (muteType == "mute") {
-      return true;
-
-      /// Check if the sender is muted
-    } else if (muteType == "mute_individuals") {
-      List<String> individuals = muteArgs!.split(",");
-      return individuals.contains(message?.handle?.address ?? "");
-
-      /// Check if the chat is temporarily muted
-    } else if (muteType == "temporary_mute") {
-      DateTime time = DateTime.parse(muteArgs!);
-      bool shouldMute = DateTime.now().toLocal().difference(time).inSeconds.isNegative;
-      if (!shouldMute) {
-        toggleMute(false);
-      }
-      return shouldMute;
-
-      /// Check if the chat has specific text detection and notify accordingly
-    } else if (muteType == "text_detection") {
-      List<String> text = muteArgs!.split(",");
-      for (String s in text) {
-        if (message?.text?.toLowerCase().contains(s.toLowerCase()) ?? false) {
-          return false;
-        }
-      }
-      return true;
-    }
-
-    /// If reaction and notify reactions off, then don't notify, otherwise notify
-    return !ss.settings.notifyReactions.value &&
-        ReactionTypes.toList().contains(message?.associatedMessageType ?? "");
+  // Unknown sender check  
+  if (ss.settings.filterUnknownSenders.value &&
+      participants.length == 1 &&
+      participants.first.contact == null &&
+      !isWhitelisted) {
+    return true;
   }
+  
+  // Global text detection check  
+  if (ss.settings.globalTextDetection.value.isNotEmpty) {
+    List<String> text = ss.settings.globalTextDetection.value.split(",");
+    for (String s in text) {
+      if (message?.text?.toLowerCase().contains(s.toLowerCase()) ?? false) {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  // Individual muting checks
+  if (muteType == "mute") {
+    return true;
+  }
+
+  if (muteType == "mute_individuals") {
+    List<String> individuals = muteArgs!.split(",");
+    return individuals.contains(message?.handle?.address ?? "");
+  }
+
+  if (muteType == "temporary_mute") {
+    DateTime time = DateTime.parse(muteArgs!);
+    bool shouldMute = DateTime.now().toLocal().difference(time).inSeconds.isNegative;
+    if (!shouldMute) {
+      toggleMute(false);
+    }
+    return shouldMute;
+  }
+
+  if (muteType == "text_detection") {
+    List<String> text = muteArgs!.split(",");
+    for (String s in text) {
+      if (message?.text?.toLowerCase().contains(s.toLowerCase()) ?? false) {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  // Reaction notification check
+  return !ss.settings.notifyReactions.value &&
+      ReactionTypes.toList().contains(message?.associatedMessageType ?? "");
+}
 
   /// Delete a chat locally. Prefer using softDelete so the chat doesn't come back
   static void deleteChat(Chat chat) async {
@@ -1016,14 +1026,25 @@ class Chat {
       serverSyncParticipants();
     }
 
+    // Once we send a message, consider them "known"
+    if (message.isFromMe! && participants.length == 1 && participants.first.contact == null && ss.settings.filterUnknownSenders.value) {
+      isWhitelisted = true;
+      save(updateWhitelisted: true);
+    }
+
     // Return the current chat instance (with updated vals)
     return this;
   }
 
+  // Add whitelisting check for participant changes
   void serverSyncParticipants() async {
-    // Send message to server to get the participants
+    final prevParticipants = [...participants];
     final chat = await cm.fetchChat(guid);
     if (chat != null) {
+      // Preserve whitelisted status if becoming group chat
+      if (isWhitelisted && prevParticipants.length == 1 && chat.participants.length > 1) {
+        chat.isWhitelisted = true;
+      }
       chat.save();
     }
   }
@@ -1320,6 +1341,7 @@ class Chat {
     title ??= other.title;
     dateDeleted ??= other.dateDeleted;
     style ??= other.style;
+    isWhitelisted = other.isWhitelisted || isWhitelisted;
     return this;
   }
 
